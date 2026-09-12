@@ -159,9 +159,15 @@ class LLMRouter:
             model = self._model_for(provider, kind)
             # Vision calls (large image payloads, bigger models) get their own,
             # longer timeout — a 90B vision model routinely takes longer than
-            # a short text extraction call.
-            timeout_env = "LLM_VISION_TIMEOUT_SECONDS" if kind == "vision" else "LLM_TIMEOUT_SECONDS"
-            call_timeout = float(os.getenv(timeout_env, "120" if kind == "vision" else "60"))
+            # a short text extraction call. A per-provider override (e.g.
+            # OLLAMA_TIMEOUT_SECONDS) beats the generic default — a local
+            # "thinking" model can be slow on a complex prompt even though a
+            # trivial one comes back fast, and there's no cost/quota reason
+            # to time it out aggressively.
+            generic_env = "LLM_VISION_TIMEOUT_SECONDS" if kind == "vision" else "LLM_TIMEOUT_SECONDS"
+            provider_env = f"{provider.upper()}_VISION_TIMEOUT_SECONDS" if kind == "vision" else f"{provider.upper()}_TIMEOUT_SECONDS"
+            default = "120" if kind == "vision" else "60"
+            call_timeout = float(os.getenv(provider_env, os.getenv(generic_env, default)))
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
