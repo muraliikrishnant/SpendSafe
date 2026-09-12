@@ -16,6 +16,28 @@ from datetime import date, datetime
 from typing import Iterator
 
 
+_CURRENCY_SYMBOL_TO_ISO = {
+    "₹": "INR", "RS": "INR", "RS.": "INR",
+    "$": "USD", "US$": "USD",
+    "€": "EUR",
+    "R": "ZAR",
+    "RP": "IDR", "RP.": "IDR",
+}
+_KNOWN_ISO_CODES = {"INR", "ZAR", "IDR", "USD", "EUR"}
+
+
+def _normalize_currency_code(code: str) -> str:
+    """Defense-in-depth: the exchange-rate table only knows ISO 4217 codes.
+    A currency symbol or locale variant reaching here (from any source)
+    would otherwise fail conversion outright."""
+    if not code:
+        return code
+    upper = code.strip().upper()
+    if upper in _KNOWN_ISO_CODES:
+        return upper
+    return _CURRENCY_SYMBOL_TO_ISO.get(upper, code.strip())
+
+
 def _parse_date(s: str) -> date | None:
     if not s:
         return None
@@ -76,6 +98,8 @@ class DataStore:
         return os.path.join(self.dataset_dir, "media", "images", f"{image_id}.png")
 
     def convert(self, amount: float, from_ccy: str, to_ccy: str, on: date) -> float:
+        from_ccy = _normalize_currency_code(from_ccy)
+        to_ccy = _normalize_currency_code(to_ccy)
         if from_ccy == to_ccy:
             return amount
         key = (on.isoformat(), from_ccy, to_ccy)

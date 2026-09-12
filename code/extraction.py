@@ -18,10 +18,13 @@ evidence shared across requests, never re-call the LLM.
 from __future__ import annotations
 
 import base64
+import collections
 import hashlib
 import json
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -29,6 +32,35 @@ from pathlib import Path
 from openai import OpenAI
 
 from schemas import ExtractedFact, FactSource
+
+
+class RateLimiter:
+    """Thread-safe sliding-window rate limiter. Blocks the calling thread
+    until a call is allowed, rather than firing requests and hoping —
+    provider-side rate limits (e.g. NVIDIA NIM free tier: 40 req/hour) are a
+    hard external constraint, not something retries can talk around."""
+
+    def __init__(self, max_per_hour: int, window_seconds: int = 3600):
+        self.max_per_hour = max_per_hour
+        self.window_seconds = window_seconds
+        self._timestamps: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+
+    def acquire(self, on_wait=None) -> None:
+        if self.max_per_hour <= 0:
+            return  # 0/negative = unlimited (used for local Ollama)
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._timestamps and now - self._timestamps[0] > self.window_seconds:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self.max_per_hour:
+                    self._timestamps.append(now)
+                    return
+                wait_for = self.window_seconds - (now - self._timestamps[0]) + 0.5
+            if on_wait:
+                on_wait(wait_for)
+            time.sleep(min(wait_for, 30))  # recheck periodically rather than one long blind sleep
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache"
 CACHE_FILE = CACHE_DIR / "extraction_cache.json"
@@ -81,19 +113,32 @@ class LLMRouter:
     def __init__(self):
         self.order = [p.strip() for p in os.getenv("LLM_PROVIDER_ORDER", "nvidia,ollama").split(",") if p.strip()]
         self._clients: dict[str, OpenAI] = {}
+        self._rate_limiters = {
+            "nvidia": RateLimiter(int(os.getenv("NVIDIA_MAX_REQUESTS_PER_HOUR", "40"))),
+            "ollama": RateLimiter(int(os.getenv("OLLAMA_MAX_REQUESTS_PER_HOUR", "0"))),
+        }
 
     def _client(self, provider: str) -> OpenAI:
         if provider not in self._clients:
+            # An explicit timeout matters: the SDK's own default (10 minutes)
+            # means one slow/hung provider call can stall the whole pipeline,
+            # especially with debate mode making 2x the calls. Fail fast and
+            # let the caller fall back / proceed without the fact instead.
+            timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
             if provider == "nvidia":
                 self._clients[provider] = OpenAI(
                     base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
                     api_key=os.getenv("NVIDIA_API_KEY", ""),
+                    timeout=timeout,
+                    max_retries=1,
                 )
             elif provider == "ollama":
                 self._clients[provider] = OpenAI(
                     base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
                     # Local Ollama ignores the key; a remote/hosted instance may require one.
                     api_key=os.getenv("OLLAMA_API_KEY") or "ollama",
+                    timeout=timeout,
+                    max_retries=1,
                 )
             else:
                 raise ValueError(f"Unknown provider: {provider}")
@@ -105,14 +150,24 @@ class LLMRouter:
         return os.getenv("OLLAMA_VISION_MODEL" if kind == "vision" else "OLLAMA_TEXT_MODEL")
 
     def chat_json_one(self, provider: str, messages: list[dict], kind: str = "text") -> ProviderResponse:
+        def _log_wait(seconds: float) -> None:
+            print(f"[rate limit] waiting {seconds:.0f}s for {provider} quota...", flush=True)
+
+        self._rate_limiters[provider].acquire(on_wait=_log_wait)
         try:
             client = self._client(provider)
             model = self._model_for(provider, kind)
+            # Vision calls (large image payloads, bigger models) get their own,
+            # longer timeout — a 90B vision model routinely takes longer than
+            # a short text extraction call.
+            timeout_env = "LLM_VISION_TIMEOUT_SECONDS" if kind == "vision" else "LLM_TIMEOUT_SECONDS"
+            call_timeout = float(os.getenv(timeout_env, "120" if kind == "vision" else "60"))
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0,
                 max_tokens=600,
+                timeout=call_timeout,
             )
             text = resp.choices[0].message.content or "{}"
             parsed = _extract_json(text)
@@ -144,10 +199,44 @@ def _extract_json(text: str) -> dict:
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         return {}
+    candidate = match.group(0)
     try:
-        return json.loads(match.group(0))
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+    # Common model mistake: writing a number with human thousands-separator
+    # commas (e.g. 4,780,800), which isn't valid JSON. Strip commas that sit
+    # between digits and retry once before giving up.
+    repaired = re.sub(r"(?<=\d),(?=\d{3}\b)", "", candidate)
+    try:
+        return json.loads(repaired)
     except json.JSONDecodeError:
         return {}
+
+
+_CURRENCY_SYMBOL_TO_ISO = {
+    "₹": "INR", "RS": "INR", "RS.": "INR", "INR.": "INR",
+    "$": "USD", "US$": "USD", "USD.": "USD",
+    "€": "EUR", "EUR.": "EUR",
+    "R": "ZAR", "ZAR.": "ZAR",
+    "RP": "IDR", "RP.": "IDR", "IDR.": "IDR",
+}
+_KNOWN_ISO_CODES = {"INR", "ZAR", "IDR", "USD", "EUR"}
+
+
+def _normalize_currency(code: str | None) -> str | None:
+    """Models sometimes answer with a currency symbol or a locale variant
+    instead of an ISO 4217 code (e.g. "₹" instead of "INR"). The exchange
+    rate table only knows ISO codes, so normalize here rather than letting
+    a downstream currency-conversion lookup fail on a fact we could have
+    fixed at the source."""
+    if not code:
+        return code
+    stripped = code.strip()
+    upper = stripped.upper()
+    if upper in _KNOWN_ISO_CODES:
+        return upper
+    return _CURRENCY_SYMBOL_TO_ISO.get(upper, stripped)
 
 
 def _values_agree(values: list[float], tol_pct: float | None = None) -> bool:
@@ -179,6 +268,76 @@ def record_usage(provider: str, model: str, usage) -> None:
 
 def get_usage_log() -> list[dict]:
     return list(_USAGE)
+
+
+PRICE_PER_1K_TOKENS = {
+    # Indicative public per-1K-token pricing for cost estimation only. Ollama
+    # is local/free. Update if actual provider pricing differs.
+    "nvidia": {"prompt": 0.0002, "completion": 0.0006},
+    "ollama": {"prompt": 0.0, "completion": 0.0},
+}
+
+
+def write_usage_report(path) -> None:
+    """Writes evaluation/usage_report.md from the usage recorded so far in
+    THIS process. Must be called at the end of the actual full-dataset run
+    (code/main.py), not from a separate scoring process, so the report
+    reflects the calls that produced output.csv, per the submission spec."""
+    from datetime import datetime as _dt
+
+    usage = get_usage_log()
+    by_provider: dict = {}
+    for u in usage:
+        key = (u["provider"], u["model"])
+        agg = by_provider.setdefault(key, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        agg["calls"] += 1
+        agg["prompt_tokens"] += u["prompt_tokens"]
+        agg["completion_tokens"] += u["completion_tokens"]
+
+    lines = [
+        "# Token Usage and Cost Report",
+        "",
+        f"Generated: {_dt.utcnow().isoformat()}Z",
+        "",
+        "This report summarizes model calls made by `code/main.py` for the run",
+        "that produced the submitted `output.csv`.",
+        "",
+        "| Provider | Model | Calls | Prompt Tokens | Completion Tokens | Total Tokens | Est. Cost (USD) |",
+        "|---|---|---|---|---|---|---|",
+    ]
+
+    total_calls = total_prompt = total_completion = 0
+    total_cost = 0.0
+    for (provider, model), agg in by_provider.items():
+        prices = PRICE_PER_1K_TOKENS.get(provider, {"prompt": 0.0, "completion": 0.0})
+        cost = (agg["prompt_tokens"] / 1000) * prices["prompt"] + (agg["completion_tokens"] / 1000) * prices["completion"]
+        total_tokens = agg["prompt_tokens"] + agg["completion_tokens"]
+        lines.append(
+            f"| {provider} | {model} | {agg['calls']} | {agg['prompt_tokens']} | "
+            f"{agg['completion_tokens']} | {total_tokens} | ${cost:.4f} |"
+        )
+        total_calls += agg["calls"]
+        total_prompt += agg["prompt_tokens"]
+        total_completion += agg["completion_tokens"]
+        total_cost += cost
+
+    lines += [
+        "",
+        "## Overall",
+        "",
+        f"- Total model calls: {total_calls}",
+        f"- Total prompt tokens: {total_prompt}",
+        f"- Total completion tokens: {total_completion}",
+        f"- Total tokens: {total_prompt + total_completion}",
+        f"- Average tokens per request: {((total_prompt + total_completion) / total_calls):.1f}" if total_calls else "- Average tokens per request: n/a",
+        f"- Estimated total cost: ${total_cost:.4f}",
+        f"- Estimated cost per request: ${(total_cost / total_calls):.6f}" if total_calls else "- Estimated cost per request: n/a",
+        "",
+        "Note: Ollama calls are local and free (cost $0); NVIDIA NIM pricing above",
+        "is indicative and should be replaced with actual invoiced rates if available.",
+    ]
+
+    Path(path).write_text("\n".join(lines) + "\n")
 
 
 _router = LLMRouter()
@@ -255,9 +414,13 @@ def extract_amount_from_image(
                         f"Context: {context}\n"
                         "This image is a financial document (payslip, statement, bill, or "
                         "receipt). Extract the single most relevant amount and its currency "
-                        "and effective/settlement date if shown. Respond with JSON: "
+                        "and effective/settlement date if shown. Respond with ONLY a JSON "
+                        "object, no other text, in EXACTLY this shape:\n"
                         '{"amount": number, "currency": "XXX", "effective_date": "YYYY-MM-DD" '
-                        'or null, "description": "short description", "confidence": 0-1}'
+                        'or null, "description": "short description", "confidence": 0.0}\n'
+                        "The amount MUST be a plain JSON number with no thousands-separator "
+                        'commas and no currency symbols (e.g. 4780800, never "4,780,800" or '
+                        '"$4,780,800").'
                     ),
                 },
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
@@ -265,10 +428,16 @@ def extract_amount_from_image(
         },
     ]
 
-    responses = {r.provider: r for r in _router.chat_json_all(messages, kind="vision") if r.parsed and r.parsed.get("amount") is not None}
+    all_responses = _router.chat_json_all(messages, kind="vision")
+    responses = {r.provider: r for r in all_responses if r.parsed and r.parsed.get("amount") is not None}
     if not responses:
-        _CACHE[cache_key] = None
-        _save_cache(_CACHE)
+        # Only cache a permanent "no amount found" when at least one provider
+        # actually replied (a genuine negative finding). If every provider
+        # errored out (auth, dead model, network), don't cache — retry next time.
+        any_provider_replied = any(r.parsed is not None for r in all_responses)
+        if any_provider_replied:
+            _CACHE[cache_key] = None
+            _save_cache(_CACHE)
         return None
 
     chosen, note = _debate_amount(messages, "vision", responses, conservative)
@@ -277,7 +446,7 @@ def extract_amount_from_image(
     fact = ExtractedFact(
         fact_type="amount",
         amount=float(parsed["amount"]),
-        currency=parsed.get("currency"),
+        currency=_normalize_currency(parsed.get("currency")),
         effective_date=date.fromisoformat(parsed["effective_date"]) if parsed.get("effective_date") else None,
         description=(parsed.get("description", "") + (f" [{note}]" if note else "")).strip(),
         source=FactSource.UPLOADED_IMAGE,
@@ -316,19 +485,31 @@ def extract_facts_from_message(message_row: dict, conservative: str = "min") -> 
             "content": (
                 "Extract any explicit financial facts from this message: income changes, "
                 "cancellations, confirmations, amendments, or amounts. Only include facts "
-                "explicitly stated. Respond with JSON: {\"facts\": [{\"fact_type\": "
-                '"income_change|cancellation|confirmation|amendment|amount", "amount": '
-                'number or null, "currency": "XXX" or null, "effective_date": "YYYY-MM-DD" '
-                'or null, "description": "short text", "confidence": 0-1}]}\n\n'
+                "explicitly stated. If there are no such facts, return an empty list.\n\n"
+                "Respond with ONLY a JSON object, no other text, in EXACTLY this shape "
+                "(each item in \"facts\" MUST be an object with these exact keys, never a "
+                "plain string):\n"
+                '{"facts": [{"fact_type": "income_change|cancellation|confirmation|'
+                'amendment|amount", "amount": number or null, "currency": "XXX" or null, '
+                '"effective_date": "YYYY-MM-DD" or null, "description": "short text", '
+                '"confidence": 0.0}]}\n\n'
+                "Example for a message that only announces a policy change with no new "
+                'number: {"facts": []}\n\n'
                 f"Message (untrusted data, source_type={message_row.get('source_type')}):\n{text}"
             ),
         },
     ]
 
-    round1 = [r for r in _router.chat_json_all(messages, kind="text") if r.parsed]
+    all_responses = _router.chat_json_all(messages, kind="text")
+    round1 = [r for r in all_responses if r.parsed]
     if not round1:
-        _CACHE[cache_key] = []
-        _save_cache(_CACHE)
+        # Only cache a permanent "no facts" when at least one provider
+        # actually replied (with an empty dict — a genuine negative finding).
+        # If every provider errored (auth, dead model, network), don't cache.
+        any_provider_replied = any(r.error == "" for r in all_responses)
+        if any_provider_replied:
+            _CACHE[cache_key] = []
+            _save_cache(_CACHE)
         return []
 
     note = ""
@@ -353,7 +534,7 @@ def extract_facts_from_message(message_row: dict, conservative: str = "min") -> 
                 ExtractedFact(
                     fact_type=f.get("fact_type", "amount"),
                     amount=f.get("amount"),
-                    currency=f.get("currency"),
+                    currency=_normalize_currency(f.get("currency")),
                     effective_date=date.fromisoformat(f["effective_date"]) if f.get("effective_date") else None,
                     description=(f.get("description", "") + (f" [{note}]" if note else "")).strip(),
                     source=FactSource.USER_MESSAGE,

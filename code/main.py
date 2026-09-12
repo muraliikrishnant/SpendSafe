@@ -342,6 +342,10 @@ def main() -> None:
     writer.close()
     print(f"Done. Wrote predictions to {args.output}")
 
+    usage_report_path = REPO_ROOT / "evaluation" / "usage_report.md"
+    extraction.write_usage_report(usage_report_path)
+    print(f"Wrote {usage_report_path} ({len(extraction.get_usage_log())} model calls this run)")
+
     summary = f"Processed a batch of requests from {args.dataset_dir}; wrote {args.output}."
     agents_log.log_turn(
         title="Run full-dataset affordability pipeline",
