@@ -53,7 +53,13 @@ def resolve_blank_amounts(ds: DataStore, user_id: str) -> None:
         if not img:
             continue
         context = f"{event.get('event_type')} / {event.get('category')} for a financial event on {event.get('event_date')}"
-        fact = extraction.extract_amount_from_image(ds.image_path(img["image_id"]), img["image_id"], context)
+        # Debit (expense) amounts: an unresolved contradiction is safer
+        # resolved toward the higher figure (assume the larger liability).
+        # Credit (income) amounts: resolved toward the lower figure.
+        conservative = "max" if event.get("direction") == "debit" else "min"
+        fact = extraction.extract_amount_from_image(
+            ds.image_path(img["image_id"]), img["image_id"], context, conservative=conservative
+        )
         if fact and fact.amount is not None:
             event["amount"] = str(fact.amount)
             if fact.currency:

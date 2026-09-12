@@ -1,10 +1,19 @@
 """LLM extraction layer: turns untrusted messages/images into structured,
 provenance-tagged ExtractedFact objects. Never decides affordability.
 
-Provider order is configurable (NVIDIA NIM primary, Ollama fallback) — both
-expose an OpenAI-compatible /v1 endpoint, so one client class covers both.
-Results are cached on disk by (evidence_id, content_hash) so repeated runs,
-or evidence shared across requests, never re-call the LLM.
+Every extraction call queries ALL configured providers (not just the first
+that succeeds) and cross-checks their answers — CLAUDE.md's "Contradictory
+Information" rule says never silently resolve a conflict, so when two
+models disagree we run one cross-examination round (each model sees the
+other's answer and is asked to reconsider) before taking a final value.
+If they still disagree, we take the financially safer estimate and record
+the disagreement in the fact's description so it stays auditable, and the
+fact is never marked `verified` in either case.
+
+Provider order is configurable (NVIDIA NIM, Ollama) — both expose an
+OpenAI-compatible /v1 endpoint, so one client class covers both. Results
+are cached on disk by (evidence_id, content_hash) so repeated runs, or
+evidence shared across requests, never re-call the LLM.
 """
 from __future__ import annotations
 
@@ -13,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -55,8 +65,18 @@ def _cache_key(evidence_id: str, content: str) -> str:
     return f"{evidence_id}:{h}"
 
 
+@dataclass
+class ProviderResponse:
+    provider: str
+    model: str
+    parsed: dict | None
+    error: str = ""
+
+
 class LLMRouter:
-    """Tries providers in configured order, falling back on any failure."""
+    """Queries every configured provider (chat_json_all) so answers can be
+    cross-checked, or a single one directly (chat_json_one) for a
+    cross-examination follow-up round."""
 
     def __init__(self):
         self.order = [p.strip() for p in os.getenv("LLM_PROVIDER_ORDER", "nvidia,ollama").split(",") if p.strip()]
@@ -72,7 +92,8 @@ class LLMRouter:
             elif provider == "ollama":
                 self._clients[provider] = OpenAI(
                     base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
-                    api_key="ollama",  # unused by ollama, SDK requires a non-empty value
+                    # Local Ollama ignores the key; a remote/hosted instance may require one.
+                    api_key=os.getenv("OLLAMA_API_KEY") or "ollama",
                 )
             else:
                 raise ValueError(f"Unknown provider: {provider}")
@@ -83,28 +104,39 @@ class LLMRouter:
             return os.getenv("NVIDIA_VISION_MODEL" if kind == "vision" else "NVIDIA_TEXT_MODEL")
         return os.getenv("OLLAMA_VISION_MODEL" if kind == "vision" else "OLLAMA_TEXT_MODEL")
 
+    def chat_json_one(self, provider: str, messages: list[dict], kind: str = "text") -> ProviderResponse:
+        try:
+            client = self._client(provider)
+            model = self._model_for(provider, kind)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0,
+                max_tokens=600,
+            )
+            text = resp.choices[0].message.content or "{}"
+            parsed = _extract_json(text)
+            record_usage(provider, model, getattr(resp, "usage", None))
+            return ProviderResponse(provider=provider, model=model, parsed=parsed or None)
+        except Exception as e:  # noqa: BLE001 - the caller decides how to handle a missing provider
+            return ProviderResponse(provider=provider, model=self._model_for(provider, kind), parsed=None, error=str(e))
+
+    def chat_json_all(self, messages: list[dict], kind: str = "text") -> list[ProviderResponse]:
+        """Query every configured provider independently (not fallback —
+        all of them), so their answers can be cross-checked against each
+        other before a final value is taken."""
+        return [self.chat_json_one(p, messages, kind) for p in self.order]
+
     def chat_json(self, messages: list[dict], kind: str = "text") -> tuple[dict, str, str]:
-        """Returns (parsed_json, provider_used, model_used). Raises if every
-        provider in the order fails."""
+        """Single-answer convenience path (first provider that succeeds).
+        Used only by explanation.py's optional polish pass, which doesn't
+        need cross-model debate."""
         last_err = None
         for provider in self.order:
-            try:
-                client = self._client(provider)
-                model = self._model_for(provider, kind)
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0,
-                    max_tokens=500,
-                )
-                text = resp.choices[0].message.content or "{}"
-                parsed = _extract_json(text)
-                usage = getattr(resp, "usage", None)
-                record_usage(provider, model, usage)
-                return parsed, provider, model
-            except Exception as e:  # noqa: BLE001 - provider fallback is intentional
-                last_err = e
-                continue
+            r = self.chat_json_one(provider, messages, kind)
+            if r.parsed is not None:
+                return r.parsed, r.provider, r.model
+            last_err = r.error
         raise RuntimeError(f"All LLM providers failed: {last_err}")
 
 
@@ -116,6 +148,16 @@ def _extract_json(text: str) -> dict:
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return {}
+
+
+def _values_agree(values: list[float], tol_pct: float | None = None) -> bool:
+    if len(values) < 2:
+        return True
+    tol_pct = tol_pct if tol_pct is not None else float(os.getenv("DEBATE_TOLERANCE_PCT", "2"))
+    lo, hi = min(values), max(values)
+    if hi == 0:
+        return lo == 0
+    return (hi - lo) / abs(hi) * 100 <= tol_pct
 
 
 # ---- Token/cost tracking for evaluation/usage_report.md ----
@@ -142,7 +184,57 @@ def get_usage_log() -> list[dict]:
 _router = LLMRouter()
 
 
-def extract_amount_from_image(image_path: str, image_id: str, context: str) -> ExtractedFact | None:
+def _debate_amount(
+    base_messages: list[dict],
+    kind: str,
+    amount_of: dict,  # provider -> ProviderResponse, already filtered to successes
+    conservative: str,  # "max" (assume the larger/worse-case amount) or "min"
+) -> tuple[ProviderResponse, str]:
+    """Given 2+ providers that each returned an `amount`, cross-examine on
+    disagreement and return (chosen_response, contradiction_note)."""
+    values = {p: r.parsed.get("amount") for p, r in amount_of.items() if r.parsed and r.parsed.get("amount") is not None}
+    if len(values) < 2:
+        p, r = next(iter(amount_of.items()))
+        return r, ""
+    if _values_agree(list(values.values())):
+        chosen_provider = max(values, key=lambda p: amount_of[p].parsed.get("confidence", 0.5))
+        return amount_of[chosen_provider], ""
+
+    # Round 2: cross-examination — each provider sees the others' numbers.
+    round2: dict[str, ProviderResponse] = {}
+    for provider, resp in amount_of.items():
+        others = {p: v for p, v in values.items() if p != provider}
+        followup = base_messages + [
+            {"role": "assistant", "content": json.dumps(resp.parsed)},
+            {
+                "role": "user",
+                "content": (
+                    f"An independent model extracted a different amount from the same evidence: {others}. "
+                    "Re-examine the original evidence carefully. If you made an error, correct it. If you are "
+                    "confident your original answer is right, restate it. Respond with the same JSON schema."
+                ),
+            },
+        ]
+        round2[provider] = _router.chat_json_one(provider, followup, kind)
+
+    values2 = {p: r.parsed.get("amount") for p, r in round2.items() if r.parsed and r.parsed.get("amount") is not None}
+    if len(values2) >= 2 and _values_agree(list(values2.values())):
+        chosen_provider = max(values2, key=lambda p: round2[p].parsed.get("confidence", 0.5))
+        return round2[chosen_provider], "Providers initially disagreed but converged after reconsideration."
+
+    # Still contradictory: fall back to whichever pool has values, and take
+    # the financially safer extreme rather than silently picking one side.
+    pool = round2 if values2 else amount_of
+    pool_values = values2 if values2 else values
+    target = max(pool_values.values()) if conservative == "max" else min(pool_values.values())
+    chosen_provider = min(pool_values, key=lambda p: abs(pool_values[p] - target))
+    note = f"Unresolved contradiction between providers ({pool_values}); used the more conservative estimate."
+    return pool[chosen_provider], note
+
+
+def extract_amount_from_image(
+    image_path: str, image_id: str, context: str, conservative: str = "max"
+) -> ExtractedFact | None:
     if not os.path.exists(image_path):
         return None
     img_bytes = Path(image_path).read_bytes()
@@ -172,26 +264,24 @@ def extract_amount_from_image(image_path: str, image_id: str, context: str) -> E
             ],
         },
     ]
-    try:
-        parsed, provider, model = _router.chat_json(messages, kind="vision")
-    except RuntimeError:
+
+    responses = {r.provider: r for r in _router.chat_json_all(messages, kind="vision") if r.parsed and r.parsed.get("amount") is not None}
+    if not responses:
         _CACHE[cache_key] = None
         _save_cache(_CACHE)
         return None
 
-    if not parsed or parsed.get("amount") is None:
-        _CACHE[cache_key] = None
-        _save_cache(_CACHE)
-        return None
+    chosen, note = _debate_amount(messages, "vision", responses, conservative)
+    parsed = chosen.parsed
 
     fact = ExtractedFact(
         fact_type="amount",
         amount=float(parsed["amount"]),
         currency=parsed.get("currency"),
         effective_date=date.fromisoformat(parsed["effective_date"]) if parsed.get("effective_date") else None,
-        description=parsed.get("description", ""),
+        description=(parsed.get("description", "") + (f" [{note}]" if note else "")).strip(),
         source=FactSource.UPLOADED_IMAGE,
-        confidence=float(parsed.get("confidence", 0.5)),
+        confidence=min(float(parsed.get("confidence", 0.5)), 0.5 if note else 1.0),
         verified=False,
         raw_evidence_id=image_id,
     )
@@ -200,7 +290,17 @@ def extract_amount_from_image(image_path: str, image_id: str, context: str) -> E
     return fact
 
 
-def extract_facts_from_message(message_row: dict) -> list[ExtractedFact]:
+def _first_fact_amount(parsed: dict) -> float | None:
+    facts = parsed.get("facts") if parsed else None
+    if not facts:
+        return None
+    return facts[0].get("amount")
+
+
+def extract_facts_from_message(message_row: dict, conservative: str = "min") -> list[ExtractedFact]:
+    # Default to "min": message-derived facts are most often income/salary
+    # confirmations, and CLAUDE.md says never overstate confirmed income —
+    # an unresolved contradiction should be resolved toward the lower figure.
     text = message_row.get("message_text", "")
     if not text.strip():
         return []
@@ -224,25 +324,40 @@ def extract_facts_from_message(message_row: dict) -> list[ExtractedFact]:
             ),
         },
     ]
-    try:
-        parsed, provider, model = _router.chat_json(messages, kind="text")
-    except RuntimeError:
+
+    round1 = [r for r in _router.chat_json_all(messages, kind="text") if r.parsed]
+    if not round1:
         _CACHE[cache_key] = []
         _save_cache(_CACHE)
         return []
 
+    note = ""
+    if len(round1) == 1:
+        chosen_parsed = round1[0].parsed
+    else:
+        by_provider = {r.provider: r for r in round1}
+        amounts = {p: _first_fact_amount(r.parsed) for p, r in by_provider.items()}
+        present = {p: a for p, a in amounts.items() if a is not None}
+        if len(present) < 2 or _values_agree(list(present.values())):
+            chosen_parsed = round1[0].parsed
+        else:
+            responses_for_debate = {p: r for p, r in by_provider.items() if p in present}
+            chosen, note = _debate_amount(messages, "text", responses_for_debate, conservative)
+            chosen_parsed = chosen.parsed
+
     facts = []
-    for f in parsed.get("facts", []):
+    for f in chosen_parsed.get("facts", []):
         try:
+            confidence = float(f.get("confidence", 0.5))
             facts.append(
                 ExtractedFact(
                     fact_type=f.get("fact_type", "amount"),
                     amount=f.get("amount"),
                     currency=f.get("currency"),
                     effective_date=date.fromisoformat(f["effective_date"]) if f.get("effective_date") else None,
-                    description=f.get("description", ""),
+                    description=(f.get("description", "") + (f" [{note}]" if note else "")).strip(),
                     source=FactSource.USER_MESSAGE,
-                    confidence=float(f.get("confidence", 0.5)),
+                    confidence=min(confidence, 0.5 if note else 1.0),
                     verified=False,
                     raw_evidence_id=message_row["message_id"],
                 )
