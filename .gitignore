@@ -1,0 +1,11 @@
+log.txt
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+.cache/
+code.zip
+output.csv.tmp
+*.db
