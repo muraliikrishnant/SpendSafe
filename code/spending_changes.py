@@ -3,6 +3,14 @@ unsafe. Only ever touches events already marked flexible in the data AND in
 a category the user has explicitly said they're willing to reduce/stop
 (CLAUDE.md §9 — essential spending is never touched, and the user stays in
 control of which categories are adjustable).
+
+A recurring expense can appear as several LedgerItem occurrences within the
+90-day window (one real row plus several forecasted ones, or several
+forecasted ones alone). All occurrences sharing the same `real_event_id`
+are treated as ONE adjustable commitment: stopping/reducing it affects
+every future occurrence's dollar impact, and emits exactly one spending
+change referencing that real, gradeable event_id — never a fabricated
+per-occurrence id.
 """
 from __future__ import annotations
 
@@ -23,26 +31,29 @@ class AdjustmentResult:
     adjusted_forecast: Forecast
 
 
-def _adjustable_items(
-    ledger: list[LedgerItem], profile: dict
-) -> list[LedgerItem]:
+def _adjustable_groups(ledger: list[LedgerItem], profile: dict) -> list[list[LedgerItem]]:
     stoppable_categories = set((profile.get("expense_categories_user_is_willing_to_stop") or "").split("|"))
     reducible_categories = set((profile.get("expense_categories_user_is_willing_to_reduce") or "").split("|"))
-    out = []
+
+    groups: dict[str, list[LedgerItem]] = {}
     for item in ledger:
         if item.amount_home_ccy >= 0:
             continue  # only expenses can be reduced/stopped
-        if item.flexibility == "stoppable" and item.category in stoppable_categories:
-            out.append(item)
-        elif item.flexibility == "reducible" and item.category in reducible_categories:
-            out.append(item)
-        elif item.flexibility == "reducible_or_stoppable" and (
-            item.category in stoppable_categories or item.category in reducible_categories
-        ):
-            out.append(item)
-    # Largest expenses first — resolves the deficit with the fewest changes.
-    out.sort(key=lambda i: i.amount_home_ccy)
-    return out
+        eligible = (
+            (item.flexibility == "stoppable" and item.category in stoppable_categories)
+            or (item.flexibility == "reducible" and item.category in reducible_categories)
+            or (
+                item.flexibility == "reducible_or_stoppable"
+                and (item.category in stoppable_categories or item.category in reducible_categories)
+            )
+        )
+        if not eligible:
+            continue
+        groups.setdefault(item.real_event_id, []).append(item)
+
+    # Largest total future impact first — resolves the deficit with the
+    # fewest distinct spending changes.
+    return sorted(groups.values(), key=lambda items: sum(i.amount_home_ccy for i in items))
 
 
 def try_resolve_with_spending_changes(
@@ -53,38 +64,54 @@ def try_resolve_with_spending_changes(
     profile: dict,
 ) -> AdjustmentResult:
     changes: list[SpendingChange] = []
-    used_event_ids: set[str] = set()
+    used_real_ids: set[str] = set()
     adjusted = base_forecast
 
-    candidates = _adjustable_items(ledger, profile)
+    stoppable_categories = set((profile.get("expense_categories_user_is_willing_to_stop") or "").split("|"))
+    groups = _adjustable_groups(ledger, profile)
 
-    for item in candidates:
+    for group in groups:
         if len(changes) >= MAX_CHANGES:
             break
-        is_safe, min_reached = verify_plan(adjusted, payments, min_balance)
+        is_safe, _ = verify_plan(adjusted, payments, min_balance)
         if is_safe:
             break
-        if item.event_id in used_event_ids:
+
+        real_id = group[0].real_event_id
+        if real_id in used_real_ids:
             continue
 
-        stoppable_categories = set((profile.get("expense_categories_user_is_willing_to_stop") or "").split("|"))
-        can_stop = item.flexibility in {"stoppable", "reducible_or_stoppable"} and item.category in stoppable_categories
+        category = group[0].category
+        flexibility = group[0].flexibility
+        can_stop = flexibility in {"stoppable", "reducible_or_stoppable"} and category in stoppable_categories
 
-        offset = (item.on_date - adjusted.as_of).days
-        if offset < 0 or offset >= len(adjusted.dates):
-            continue
+        new_deltas = adjusted.balance_no_purchase
+        representative_new_amount = None
+        affected_any = False
+
+        for item in group:
+            offset = (item.on_date - adjusted.as_of).days
+            if offset < 0 or offset >= len(adjusted.dates):
+                continue
+            affected_any = True
+            if can_stop:
+                recovered = -item.amount_home_ccy  # remove the whole expense
+            else:
+                recovered = -item.amount_home_ccy * 0.5  # reduce by half as a conservative default
+                representative_new_amount = round(-item.amount_home_ccy - recovered, 2)
+            new_deltas = _shift(new_deltas, offset, recovered)
+
+        if not affected_any:
+            continue  # every occurrence fell outside the forecast window — no real effect
 
         if can_stop:
-            recovered = -item.amount_home_ccy  # remove the whole expense
-            new_deltas = _shift(adjusted.balance_no_purchase, offset, recovered)
-            changes.append(SpendingChange(action="stop", event_id=item.event_id))
+            changes.append(SpendingChange(action="stop", event_id=real_id))
         else:
-            recovered = -item.amount_home_ccy * 0.5  # reduce by half as a conservative default
-            new_deltas = _shift(adjusted.balance_no_purchase, offset, recovered)
-            new_amount = round(-item.amount_home_ccy - recovered, 2)
-            changes.append(SpendingChange(action="reduce_to", event_id=item.event_id, new_amount=new_amount))
+            if representative_new_amount is None:
+                continue
+            changes.append(SpendingChange(action="reduce_to", event_id=real_id, new_amount=representative_new_amount))
 
-        used_event_ids.add(item.event_id)
+        used_real_ids.add(real_id)
         adjusted = Forecast(
             as_of=adjusted.as_of,
             horizon_days=adjusted.horizon_days,

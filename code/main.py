@@ -322,6 +322,11 @@ def main() -> None:
     load_dotenv(REPO_ROOT / ".env")
     agents_log.session_start()
 
+    if args.no_resume:
+        # A genuine fresh full-dataset run — the usage report should reflect
+        # only this run's calls, not leftovers from a previous one.
+        extraction.reset_usage_log()
+
     from output_writer import OutputWriter
 
     ds = DataStore.load(args.dataset_dir)
@@ -343,8 +348,11 @@ def main() -> None:
     print(f"Done. Wrote predictions to {args.output}")
 
     usage_report_path = REPO_ROOT / "evaluation" / "usage_report.md"
-    extraction.write_usage_report(usage_report_path)
-    print(f"Wrote {usage_report_path} ({len(extraction.get_usage_log())} model calls this run)")
+    # Total requests actually in output.csv now (not just this invocation's
+    # delta) — "average tokens per request" should be over the whole
+    # dataset the report's calls collectively cover.
+    extraction.write_usage_report(usage_report_path, total_requests=len(writer.done_request_ids))
+    print(f"Wrote {usage_report_path} ({len(extraction.get_usage_log())} total model calls recorded)")
 
     summary = f"Processed a batch of requests from {args.dataset_dir}; wrote {args.output}."
     agents_log.log_turn(

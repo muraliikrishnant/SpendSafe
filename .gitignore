@@ -9,3 +9,4 @@ venv/
 code.zip
 output.csv.tmp
 *.db
+.DS_Store

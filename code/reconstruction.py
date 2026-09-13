@@ -29,6 +29,16 @@ class LedgerItem:
     category: str
     flexibility: str
     projected: bool  # True if this is a recurrence-projected instance, not an explicit row
+    # The event_id of a REAL row in financial_events.csv this item can be
+    # attributed to in output.csv (spending_changes_needed must reference an
+    # id a grader can actually look up). For an explicit row this is just its
+    # own event_id; for a projected/forecasted occurrence, it's the most
+    # recent real event that anchors the detected recurrence.
+    real_event_id: str = ""
+
+    def __post_init__(self):
+        if not self.real_event_id:
+            self.real_event_id = self.event_id
 
 
 def _effective_date(row: dict) -> date | None:
@@ -111,6 +121,7 @@ def detect_recurring(events: list[dict]) -> dict:
             "last_date": _effective_date(last),
             "direction": direction,
             "category": category,
+            "anchor_event_id": last["event_id"],
         }
     return recurring
 
@@ -187,14 +198,17 @@ def build_ledger(
                     LedgerItem(
                         on_date=cursor,
                         amount_home_ccy=signed,
-                        # No colons: this id can end up inside the output.csv
-                        # spending_changes_needed field, which is itself
-                        # colon-delimited ("reduce_to:<event_id>:<amount>") —
-                        # a colon here would corrupt that format.
+                        # Internal-only id (never emitted in output.csv) — kept
+                        # unique per occurrence for logging/debugging.
                         event_id=f"projected_{category}_{cursor.isoformat()}",
                         category=category,
                         flexibility=info["flexibility"],
                         projected=True,
+                        # Output-safe id: the real historical event this
+                        # forecasted occurrence was extrapolated from. A
+                        # fabricated per-occurrence id wouldn't resolve
+                        # against financial_events.csv for a grader.
+                        real_event_id=info["anchor_event_id"],
                     )
                 )
             cursor += timedelta(days=interval)

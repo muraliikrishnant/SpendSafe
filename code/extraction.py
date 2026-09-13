@@ -284,24 +284,49 @@ def _values_agree(values: list[float], tol_pct: float | None = None) -> bool:
 
 
 # ---- Token/cost tracking for evaluation/usage_report.md ----
-_USAGE: list[dict] = []
+# Persisted to disk (not just kept in memory) because code/main.py is
+# resumable: a run that only reprocesses a handful of rows (the rest served
+# from cache, 0 new calls) must not make the usage report look like the
+# ENTIRE output.csv only cost that handful of calls. The disk log
+# accumulates across resumed runs and is only reset by a genuine fresh
+# (--no-resume) run — see reset_usage_log().
+USAGE_LOG_FILE = CACHE_DIR / "usage_log.jsonl"
+_usage_lock = threading.Lock()
 
 
 def record_usage(provider: str, model: str, usage) -> None:
     if usage is None:
         return
-    _USAGE.append(
-        {
-            "provider": provider,
-            "model": model,
-            "prompt_tokens": getattr(usage, "prompt_tokens", 0),
-            "completion_tokens": getattr(usage, "completion_tokens", 0),
-        }
-    )
+    record = {
+        "provider": provider,
+        "model": model,
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+        "completion_tokens": getattr(usage, "completion_tokens", 0),
+    }
+    with _usage_lock:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(USAGE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
 
 
 def get_usage_log() -> list[dict]:
-    return list(_USAGE)
+    if not USAGE_LOG_FILE.exists():
+        return []
+    records = []
+    with open(USAGE_LOG_FILE, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def reset_usage_log() -> None:
+    """Call at the start of a genuine fresh (--no-resume) full-dataset run
+    so its usage report reflects only that run, not calls from a previous
+    unrelated run."""
+    if USAGE_LOG_FILE.exists():
+        USAGE_LOG_FILE.unlink()
 
 
 PRICE_PER_1K_TOKENS = {
@@ -312,11 +337,17 @@ PRICE_PER_1K_TOKENS = {
 }
 
 
-def write_usage_report(path) -> None:
-    """Writes evaluation/usage_report.md from the usage recorded so far in
-    THIS process. Must be called at the end of the actual full-dataset run
-    (code/main.py), not from a separate scoring process, so the report
-    reflects the calls that produced output.csv, per the submission spec."""
+def write_usage_report(path, total_requests: int | None = None) -> None:
+    """Writes evaluation/usage_report.md from the persisted usage log. Must
+    be called at the end of the actual full-dataset run (code/main.py), not
+    from a separate scoring process, so the report reflects the calls that
+    produced output.csv, per the submission spec.
+
+    `total_requests` is the number of rows in requests.csv — the spec asks
+    for "average tokens per request", which is total_tokens / request count,
+    not total_tokens / LLM call count (a request can need 0, 1, or several
+    calls depending on cached evidence). Falls back to per-call average
+    only if the request count isn't known."""
     from datetime import datetime as _dt
 
     usage = get_usage_log()
@@ -355,6 +386,10 @@ def write_usage_report(path) -> None:
         total_completion += agg["completion_tokens"]
         total_cost += cost
 
+    total_tokens_all = total_prompt + total_completion
+    per_request_divisor = total_requests if total_requests else total_calls
+    per_request_label = "request" if total_requests else "call (request count unknown)"
+
     lines += [
         "",
         "## Overall",
@@ -362,10 +397,18 @@ def write_usage_report(path) -> None:
         f"- Total model calls: {total_calls}",
         f"- Total prompt tokens: {total_prompt}",
         f"- Total completion tokens: {total_completion}",
-        f"- Total tokens: {total_prompt + total_completion}",
-        f"- Average tokens per request: {((total_prompt + total_completion) / total_calls):.1f}" if total_calls else "- Average tokens per request: n/a",
+        f"- Total tokens: {total_tokens_all}",
+        (
+            f"- Average tokens per {per_request_label}: {(total_tokens_all / per_request_divisor):.1f}"
+            if per_request_divisor
+            else "- Average tokens per request: n/a"
+        ),
         f"- Estimated total cost: ${total_cost:.4f}",
-        f"- Estimated cost per request: ${(total_cost / total_calls):.6f}" if total_calls else "- Estimated cost per request: n/a",
+        (
+            f"- Estimated cost per {per_request_label}: ${(total_cost / per_request_divisor):.6f}"
+            if per_request_divisor
+            else "- Estimated cost per request: n/a"
+        ),
         "",
         "Note: Ollama calls are local and free (cost $0); NVIDIA NIM pricing above",
         "is indicative and should be replaced with actual invoiced rates if available.",
