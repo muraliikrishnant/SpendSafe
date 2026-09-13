@@ -262,6 +262,18 @@ def process_request(row: dict, ds: DataStore) -> OutputRow:
                 spending_changes_used = best_result.changes
                 chosen_forecast = best_result.adjusted_forecast
 
+        # Final safety gate. Candidates were each checked when they were built,
+        # but nothing re-checked the plan that actually WON after spending
+        # changes were applied on top of it. Re-verify the chosen schedule
+        # against the forecast actually in force; if it doesn't hold, emit
+        # not_recommended rather than a plan we can't demonstrate is safe.
+        if chosen is not None and chosen.method != "wait":
+            final_safe, _ = se.verify_plan(chosen_forecast, chosen.payments, min_balance)
+            if not final_safe:
+                chosen = None
+                spending_changes_used = []
+                chosen_forecast = forecast
+
         worst_case = min(chosen_forecast.balance_no_purchase)
 
         if chosen is None:

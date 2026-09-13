@@ -35,6 +35,9 @@ class LedgerItem:
     # own event_id; for a projected/forecasted occurrence, it's the most
     # recent real event that anchors the detected recurrence.
     real_event_id: str = ""
+    # The event's own minimum_allowed_amount, converted to home currency.
+    # A reduce_to may never take the expense below this floor.
+    min_allowed: float | None = None
 
     def __post_init__(self):
         if not self.real_event_id:
@@ -44,6 +47,15 @@ class LedgerItem:
 def _effective_date(row: dict) -> date | None:
     d = row.get("settlement_date") or row.get("event_date")
     return _parse_date(d) if d else None
+
+
+def _opt_float(raw: str | None) -> float | None:
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 def resolve_events(raw_events: list[dict]) -> list[dict]:
@@ -122,6 +134,7 @@ def detect_recurring(events: list[dict]) -> dict:
             "direction": direction,
             "category": category,
             "anchor_event_id": last["event_id"],
+            "anchor_min_allowed": _opt_float(last.get("minimum_allowed_amount")),
         }
     return recurring
 
@@ -170,6 +183,7 @@ def build_ledger(
         amount_home = ds.convert(amount, e["currency"], home_ccy, eff_date)
         signed = amount_home if direction == "credit" else -amount_home
 
+        raw_floor = _opt_float(e.get("minimum_allowed_amount"))
         items.append(
             LedgerItem(
                 on_date=eff_date,
@@ -178,6 +192,13 @@ def build_ledger(
                 category=e["category"],
                 flexibility=e.get("flexibility", "fixed"),
                 projected=False,
+                # The floor is stated in the event's own currency — convert it
+                # on the same date/rate as the amount it constrains.
+                min_allowed=(
+                    ds.convert(raw_floor, e["currency"], home_ccy, eff_date)
+                    if raw_floor is not None
+                    else None
+                ),
             )
         )
         explicit_dates_by_category.setdefault(e["category"], set()).add(eff_date)
@@ -209,6 +230,11 @@ def build_ledger(
                         # fabricated per-occurrence id wouldn't resolve
                         # against financial_events.csv for a grader.
                         real_event_id=info["anchor_event_id"],
+                        min_allowed=(
+                            ds.convert(info["anchor_min_allowed"], info["currency"], home_ccy, cursor)
+                            if info["anchor_min_allowed"] is not None
+                            else None
+                        ),
                     )
                 )
             cursor += timedelta(days=interval)

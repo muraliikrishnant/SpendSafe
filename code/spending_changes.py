@@ -93,16 +93,25 @@ def try_resolve_with_spending_changes(
             offset = (item.on_date - adjusted.as_of).days
             if offset < 0 or offset >= len(adjusted.dates):
                 continue
-            affected_any = True
+            spend = -item.amount_home_ccy  # positive magnitude of the expense
             if can_stop:
-                recovered = -item.amount_home_ccy  # remove the whole expense
+                recovered = spend  # remove the whole expense
             else:
-                recovered = -item.amount_home_ccy * 0.5  # reduce by half as a conservative default
-                representative_new_amount = round(-item.amount_home_ccy - recovered, 2)
+                # Halve it, but never below the event's own
+                # minimum_allowed_amount — the dataset states a floor for every
+                # reducible event, and a naive 50% cut breaches it often.
+                target = spend * 0.5
+                if item.min_allowed is not None:
+                    target = max(target, item.min_allowed)
+                if target >= spend - 0.01:
+                    continue  # already at its floor — no headroom to reduce
+                recovered = spend - target
+                representative_new_amount = round(target, 2)
+            affected_any = True
             new_deltas = _shift(new_deltas, offset, recovered)
 
         if not affected_any:
-            continue  # every occurrence fell outside the forecast window — no real effect
+            continue  # no occurrence in-window with any headroom to change
 
         if can_stop:
             changes.append(SpendingChange(action="stop", event_id=real_id))
