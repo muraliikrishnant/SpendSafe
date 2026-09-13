@@ -25,6 +25,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -183,10 +184,37 @@ class LLMRouter:
             return ProviderResponse(provider=provider, model=self._model_for(provider, kind), parsed=None, error=str(e))
 
     def chat_json_all(self, messages: list[dict], kind: str = "text") -> list[ProviderResponse]:
-        """Query every configured provider independently (not fallback —
-        all of them), so their answers can be cross-checked against each
-        other before a final value is taken."""
-        return [self.chat_json_one(p, messages, kind) for p in self.order]
+        """Query configured providers so their answers can be cross-checked.
+
+        DEBATE_MODE controls how many providers are actually queried, since
+        "always call every provider" is fundamentally bounded by the
+        slowest/most rate-limited one (e.g. NVIDIA NIM's free-tier 40
+        req/hour) — that doesn't scale to a large dataset:
+          - "full" (default): query every provider in LLM_PROVIDER_ORDER.
+          - "sampled": query all providers for a DEBATE_SAMPLE_RATE fraction
+            of calls (deterministic, hashed on the prompt so it's stable
+            across cache misses/retries); otherwise query only the first.
+          - "off": query only the first provider (no cross-checking).
+        Providers are queried concurrently, not sequentially, so the cost is
+        max(provider latencies) rather than their sum.
+        """
+        mode = os.getenv("DEBATE_MODE", "full").strip().lower()
+        providers = self.order
+        if mode == "off":
+            providers = self.order[:1]
+        elif mode == "sampled":
+            rate = float(os.getenv("DEBATE_SAMPLE_RATE", "0.1"))
+            content_hash = hashlib.sha256(json.dumps(messages, sort_keys=True).encode("utf-8")).hexdigest()
+            sample_value = int(content_hash[:8], 16) / 0xFFFFFFFF
+            if sample_value >= rate:
+                providers = self.order[:1]
+
+        if len(providers) == 1:
+            return [self.chat_json_one(providers[0], messages, kind)]
+
+        with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+            futures = [pool.submit(self.chat_json_one, p, messages, kind) for p in providers]
+            return [f.result() for f in futures]
 
     def chat_json(self, messages: list[dict], kind: str = "text") -> tuple[dict, str, str]:
         """Single-answer convenience path (first provider that succeeds).

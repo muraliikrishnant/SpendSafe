@@ -187,7 +187,11 @@ def build_ledger(
                     LedgerItem(
                         on_date=cursor,
                         amount_home_ccy=signed,
-                        event_id=f"projected:{category}:{cursor.isoformat()}",
+                        # No colons: this id can end up inside the output.csv
+                        # spending_changes_needed field, which is itself
+                        # colon-delimited ("reduce_to:<event_id>:<amount>") —
+                        # a colon here would corrupt that format.
+                        event_id=f"projected_{category}_{cursor.isoformat()}",
                         category=category,
                         flexibility=info["flexibility"],
                         projected=True,

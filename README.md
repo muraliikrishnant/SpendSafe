@@ -29,10 +29,67 @@ python3 evaluation/main.py   # scores against dataset/sample_requests.csv, write
 ```
 
 `code/main.py` is resumable (`--no-resume` to force a clean rerun) and takes `--workers`/`--batch-size` to
-tune concurrency. LLM calls (image/message extraction) try NVIDIA NIM first, then fall back to Ollama, per
-`LLM_PROVIDER_ORDER` in `.env`; if neither is reachable the pipeline still runs on dataset facts alone.
+tune concurrency. LLM calls (image/message extraction) query every provider in `LLM_PROVIDER_ORDER`
+(NVIDIA NIM and Ollama) and cross-check their answers — see "Cross-model debate" below; if neither is
+reachable the pipeline still runs on dataset facts alone.
 
 Architecture and module responsibilities are documented in `CLAUDE.md` at the repo root.
+
+---
+
+## Cross-model debate
+
+Every extraction call (reading an amount off an image, pulling a fact out of a message) queries **both**
+configured providers, not just the first that responds. Their answers are compared:
+
+- **Agree** (within `DEBATE_TOLERANCE_PCT`): the consensus value is used.
+- **Disagree**: each model is shown the other's answer for one reconsideration round.
+  - If they converge, the converged value is used.
+  - If they still disagree, the pipeline takes the financially safer estimate (higher for an expense,
+    lower for income) and records the disagreement in the fact's `description` field so it's auditable —
+    it's never silently resolved, per this project's CLAUDE.md rule on contradictory information.
+
+This was implemented from the start but took a few rounds of real debugging to actually fire end-to-end
+against live providers, for the record:
+
+> Yes, it's implemented and now confirmed working end-to-end with your real setup. It was implemented in
+> code from the start, but until it was actually tested it had never fired for real, because of two config
+> problems that needed fixing:
+>
+> - The `.env` had Ollama model tags (`gpt-oss:20b`, `llama3.2-vision:11b`) that didn't match what was
+>   actually pulled locally (`qwen3:14b`, `qwen3-vl:4b`, etc.) — every Ollama call was failing with
+>   "model not found."
+> - Even after fixing the tags, `llama3.2-vision` itself errored on that Ollama install
+>   (`unknown model architecture: 'mllama'`) — switched to `qwen3-vl:4b`, which works.
+>
+> With both fixed, a real extraction against a payslip image and a message showed NVIDIA
+> (`gpt-oss-20b`/`llama-3.2-11b-vision`) and Ollama (`qwen3:14b`/`qwen3-vl:4b`) both responding and
+> agreeing on the extracted amount, confirming the comparison logic actually ran rather than silently
+> falling back to one provider. The two other paths (converge after reconsideration; fall back to the
+> conservative estimate on unresolved disagreement) were separately unit-tested since that one real call
+> didn't happen to hit them.
+
+### Making this fast at scale
+
+Querying two providers for every fact is thorough but fundamentally bounded by the slowest/most
+rate-limited one — NVIDIA NIM's free tier is commonly capped at 40 requests/hour, which does not scale to
+a large dataset if every extraction needs an NVIDIA call. Two things address this:
+
+1. **Providers are queried concurrently, not sequentially** (`ThreadPoolExecutor` in
+   `LLMRouter.chat_json_all`) — a call's latency is `max(provider latencies)`, not their sum.
+2. **`DEBATE_MODE`** controls how many providers are actually queried:
+   - `full` (default): every provider, every extraction. Most rigorous, most rate-limit-bound.
+   - `sampled`: cross-checks only a `DEBATE_SAMPLE_RATE` fraction of calls (deterministic per prompt, so
+     it's stable across retries) and uses a single provider for the rest.
+   - `off`: single provider only, no cross-checking.
+
+   For a dataset much larger than 250 requests, `sampled` at a low rate (e.g. `0.05`–`0.1`) is the
+   realistic setting — it still gives an ongoing agreement-rate signal without making every single
+   extraction wait on a 40/hour quota.
+
+A hard external rate limit is also respected directly: `NVIDIA_MAX_REQUESTS_PER_HOUR` (default 40) is
+enforced by a thread-safe sliding-window limiter that **blocks and waits** for quota rather than firing
+unthrottled and risking 429s or a temporary ban.
 
 Your solution must:
 
