@@ -23,7 +23,7 @@ Read [`problem_statement.md`](./problem_statement.md) for the full task spec, in
 ```bash
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in NVIDIA_API_KEY and/or point OLLAMA_BASE_URL at a running Ollama
+cp .env.example .env   # then edit .env — see "LLM provider setup" below
 python3 code/main.py   # streams dataset/requests.csv, writes output.csv at the repo root
 python3 evaluation/main.py   # scores against dataset/sample_requests.csv, writes evaluation/usage_report.md
 ```
@@ -34,6 +34,70 @@ tune concurrency. LLM calls (image/message extraction) query every provider in `
 reachable the pipeline still runs on dataset facts alone.
 
 Architecture and module responsibilities are documented in `CLAUDE.md` at the repo root.
+
+---
+
+## LLM provider setup
+
+The pipeline uses two LLM providers for extraction (reading amounts off images, pulling facts out of
+messages). **Both are optional in the sense that you only need one working provider** — the other is used
+for cross-checking (see "Cross-model debate" below) but the pipeline degrades gracefully to whichever one
+is actually reachable, verified end-to-end.
+
+### NVIDIA NIM (`build.nvidia.com`)
+
+1. Sign in at [build.nvidia.com](https://build.nvidia.com) and generate an API key from your account
+   settings (look for "API Keys" / "Get API Key" on a model's page).
+2. **Note:** access to build.nvidia.com is tied to your NVIDIA account and its entitlements — some
+   accounts (e.g. ones provisioned through a school/institutional program) may have different or more
+   limited access than a personal account, and free-tier keys are commonly rate-limited (this project
+   defaults to assuming **40 requests/hour** — see `NVIDIA_MAX_REQUESTS_PER_HOUR` below). If you can't get
+   a key at all, skip this provider entirely — see the next section.
+3. Put it in `.env`: `NVIDIA_API_KEY=nvapi-...`
+
+### Ollama (local, free, no account needed)
+
+1. Install: `brew install ollama` (macOS) or see [ollama.com/download](https://ollama.com/download).
+2. Start the server: `ollama serve` (or it may already be running as a background service).
+3. Pull a text model and a vision model, e.g.:
+   ```bash
+   ollama pull qwen3:14b
+   ollama pull qwen3-vl:4b
+   ```
+   Check what you already have with `ollama list`, and set `OLLAMA_TEXT_MODEL` / `OLLAMA_VISION_MODEL` in
+   `.env` to match — **the exact tag matters** (e.g. `llama3.2-vision:latest` vs `llama3.2-vision:11b` are
+   different tags, and some vision model architectures aren't supported by every Ollama build — if a model
+   errors with something like `unknown model architecture`, try a different one you have pulled).
+
+### Running with only one provider
+
+**If you don't have an NVIDIA key** (e.g. it's a school-account-only key that isn't available to you),
+leave `NVIDIA_API_KEY` blank in `.env` and make sure Ollama is running — the pipeline will use Ollama
+alone. NVIDIA calls fail fast and cleanly on a missing key (an auth error, not a hang), so you don't need
+to remove `nvidia` from `LLM_PROVIDER_ORDER`, though you can (`LLM_PROVIDER_ORDER=ollama`) to skip the
+wasted attempt. The reverse also works: `LLM_PROVIDER_ORDER=nvidia` with no local Ollama running.
+
+With only one provider, cross-model debate has nothing to compare against, so every fact is accepted from
+that single provider directly (no consensus/reconsideration step — there's only one answer to take).
+
+### Full `.env` reference
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `NVIDIA_API_KEY` | Your build.nvidia.com API key. Blank = NVIDIA calls fail cleanly, Ollama-only mode. | *(blank)* |
+| `NVIDIA_BASE_URL` | NVIDIA NIM's OpenAI-compatible endpoint. | `https://integrate.api.nvidia.com/v1` |
+| `NVIDIA_TEXT_MODEL` / `NVIDIA_VISION_MODEL` | Model IDs for text/vision calls. Check `client.models.list()` if one gets deprecated. | `openai/gpt-oss-20b` / `meta/llama-3.2-11b-vision-instruct` |
+| `OLLAMA_BASE_URL` | Local (or remote) Ollama's OpenAI-compatible endpoint. | `http://localhost:11434/v1` |
+| `OLLAMA_API_KEY` | Only needed for a remote/hosted Ollama that requires auth; local Ollama ignores it. | *(blank)* |
+| `OLLAMA_TEXT_MODEL` / `OLLAMA_VISION_MODEL` | Must exactly match a tag from `ollama list`. | `qwen3:14b` / `qwen3-vl:4b` |
+| `LLM_PROVIDER_ORDER` | Comma-separated providers to query, e.g. `nvidia,ollama` or just `ollama`. | `nvidia,ollama` |
+| `DEBATE_MODE` | `full` (always cross-check), `sampled` (cross-check a fraction of calls), `off` (single provider). | `full` |
+| `DEBATE_SAMPLE_RATE` | Fraction of calls cross-checked when `DEBATE_MODE=sampled`. | `0.1` |
+| `DEBATE_TOLERANCE_PCT` | How close two providers' numbers must be to count as "agreeing". | `2` |
+| `LLM_TIMEOUT_SECONDS` / `LLM_VISION_TIMEOUT_SECONDS` | Generic per-call timeouts. | `60` / `120` |
+| `{PROVIDER}_TIMEOUT_SECONDS` / `{PROVIDER}_VISION_TIMEOUT_SECONDS` | Per-provider override, e.g. `OLLAMA_TIMEOUT_SECONDS=180` for a slower local "thinking" model. | *(falls back to generic)* |
+| `NVIDIA_MAX_REQUESTS_PER_HOUR` / `OLLAMA_MAX_REQUESTS_PER_HOUR` | Hard rate limit; the pipeline blocks and waits for quota rather than exceeding it. `0` = unlimited. | `40` / `0` |
+| `MAX_WORKERS` / `BATCH_SIZE` | Pipeline concurrency/streaming tuning, independent of LLM provider settings. | `8` / `50` |
 
 ---
 
