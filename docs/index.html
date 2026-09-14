@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SpendSafe — Can I Afford It?</title>
+<meta name="description" content="Ask whether you can afford a purchase, and see the 90-day balance forecast behind the answer.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --paper:#f6f4ee;--surface:#fff;--sunk:#f0ede4;
+    --ink:#16211b;--ink-soft:#5e6b63;--ink-faint:#8a968e;
+    --rule:#ded9cd;--brand:#2f6b45;--amber:#d9a23c;--stop:#a8492f;
+    --ok:#0ca30c;--crit:#d03b3b;--s1:#2a78d6;--s2:#eb6834;--viz:#fcfcfb;
+  }
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+    --paper:#0e1411;--surface:#151d19;--sunk:#111815;
+    --ink:#e7ece9;--ink-soft:#97a69d;--ink-faint:#6f7d75;
+    --rule:#29332d;--brand:#3b8355;--amber:#dfab4d;--stop:#c25b3c;
+    --s1:#3987e5;--s2:#d95926;--viz:#1a1a19;
+  }}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+    font-family:"IBM Plex Sans",system-ui,sans-serif;line-height:1.5;padding:0 18px}
+  .wrap{max-width:1080px;margin:0 auto;padding-block:34px 64px}
+  header{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;
+    border-bottom:2px solid var(--brand);padding-bottom:16px;margin-bottom:22px;flex-wrap:wrap}
+  .brand{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--brand);
+    font-weight:600;margin:0 0 4px;font-family:"IBM Plex Mono",monospace}
+  h1{font-size:clamp(26px,4vw,38px);margin:0;font-weight:700;letter-spacing:-.02em}
+  .status{font-size:12px;color:var(--ink-faint);font-family:"IBM Plex Mono",monospace}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ink-faint);margin-right:6px}
+  .dot.up{background:var(--ok)} .dot.down{background:var(--crit)} .dot.wake{background:var(--amber)}
+
+  .banner{background:var(--sunk);border:1px dashed var(--rule);padding:11px 15px;font-size:13.5px;
+    color:var(--ink-soft);margin-bottom:20px}
+  .ask{background:var(--surface);border:1px solid var(--rule);border-left:4px solid var(--brand);
+    padding:18px 20px;margin-bottom:22px}
+  .ask label{display:block;font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--ink-soft);font-weight:600;margin-bottom:9px;font-family:"IBM Plex Mono",monospace}
+  .askrow{display:flex;gap:10px;flex-wrap:wrap}
+  .askrow input{flex:1 1 320px;min-width:0}
+  input,select,button{font-family:inherit;font-size:15px;color:var(--ink)}
+  input,select{background:var(--sunk);border:1px solid var(--rule);padding:10px 12px;border-radius:2px}
+  input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+  button.go{background:var(--brand);color:#fff;border:none;padding:10px 22px;font-weight:600;cursor:pointer;border-radius:2px}
+  button.go:disabled{opacity:.55;cursor:default}
+  .hint{font-size:12.5px;color:var(--ink-faint);margin:9px 0 0}
+
+  .verdict{background:var(--surface);border:1px solid var(--rule);padding:22px;margin-bottom:22px;min-height:120px}
+  .chip{display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:600;
+    letter-spacing:.08em;text-transform:uppercase;padding:5px 11px;border-radius:2px;color:#fff}
+  .chip.now{background:var(--ok)}.chip.plan{background:var(--brand)}
+  .chip.later{background:#b07d12}.chip.no{background:var(--crit)}
+  .headline{font-size:clamp(19px,2.6vw,25px);font-weight:600;margin:14px 0 4px;letter-spacing:-.01em}
+  .because{color:var(--ink-soft);font-size:15px;margin:0;max-width:68ch}
+  .figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:1px;
+    background:var(--rule);border:1px solid var(--rule);margin-top:20px}
+  .fig{background:var(--surface);padding:13px 15px}
+  .fig dt{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-soft);
+    font-family:"IBM Plex Mono",monospace;margin-bottom:5px}
+  .fig dd{margin:0;font-size:20px;font-weight:600;font-variant-numeric:tabular-nums;font-family:"IBM Plex Mono",monospace}
+  .plan-list{list-style:none;padding:0;margin:18px 0 0;display:flex;flex-direction:column;gap:7px}
+  .plan-list li{display:flex;justify-content:space-between;gap:14px;padding:9px 13px;background:var(--sunk);
+    font-family:"IBM Plex Mono",monospace;font-size:13.5px;font-variant-numeric:tabular-nums}
+  .changes{margin:16px 0 0;padding:13px 15px;background:var(--sunk);border-left:3px solid var(--amber);font-size:14px}
+  .changes h4{margin:0 0 7px;font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-soft);
+    font-family:"IBM Plex Mono",monospace;font-weight:600}
+  .changes ul{margin:0;padding-left:19px}
+
+  h2.sec{font-size:12px;font-family:"IBM Plex Mono",monospace;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--ink-soft);margin:34px 0 12px;font-weight:600}
+  .chartcard{background:var(--surface);border:1px solid var(--rule);padding:18px}
+  .legend{display:flex;gap:20px;flex-wrap:wrap;margin:0 0 12px;padding:0;list-style:none;font-size:13px}
+  .legend li{display:flex;align-items:center;gap:8px;color:var(--ink-soft)}
+  .sw{width:20px;height:3px;flex:none;border-radius:2px}
+  .sw.d{height:0;border-top:2px dashed var(--crit)}
+  .chartbox{position:relative}
+  svg.chart{display:block;width:100%;height:auto}
+  .tip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--rule);
+    padding:8px 11px;font-size:12.5px;font-family:"IBM Plex Mono",monospace;
+    box-shadow:0 4px 14px rgba(0,0,0,.13);opacity:0;transition:opacity .1s;white-space:nowrap;border-radius:2px}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--rule);padding:18px}
+  .card h3{margin:0 0 14px;font-size:15px;font-weight:600}
+  .field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
+  .field label{font-size:12px;color:var(--ink-soft)}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+  .row .nm{flex:1 1 130px;min-width:0}.row .amt{width:104px}.row .evy{width:76px}.row .fl{width:96px}
+  button.mini{background:none;border:1px solid var(--rule);color:var(--ink-soft);padding:6px 10px;
+    font-size:12.5px;cursor:pointer;border-radius:2px}
+  button.mini:hover{border-color:var(--brand);color:var(--brand)}
+  button.del{border:none;color:var(--ink-faint);font-size:17px;line-height:1;padding:4px 7px;background:none;cursor:pointer}
+  button.del:hover{color:var(--stop)}
+  .toolbar{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}
+  details{margin-top:14px;border-top:1px solid var(--rule);padding-top:12px}
+  summary{cursor:pointer;font-size:13px;color:var(--ink-soft);font-weight:600}
+  table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13.5px}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--rule)}
+  th{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-soft)}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;font-family:"IBM Plex Mono",monospace}
+  footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--rule);font-size:12.5px;
+    color:var(--ink-faint);max-width:74ch}
+  @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div><p class="brand">SpendSafe</p><h1>Can I Afford It?</h1></div>
+    <div class="status" id="apiStatus"><span class="dot"></span>checking the engine…</div>
+  </header>
+
+  <div class="banner" id="banner">
+    Starting from an <strong>example profile</strong>. Replace the figures with your own — they stay in this
+    browser and are sent to the engine only to compute an answer, never stored.
+  </div>
+
+  <div class="ask">
+    <label for="q">Ask about a purchase</label>
+    <div class="askrow">
+      <input type="text" id="q" value="Can I afford a 65,000 laptop?" autocomplete="off">
+      <button class="go" id="askBtn">Check</button>
+    </div>
+    <p class="hint" id="askHint">Plain English works — “a 40k phone next month”, “18,000 flights by 20 December”.</p>
+  </div>
+
+  <section class="verdict" id="verdict" aria-live="polite"><p class="because">Working it out…</p></section>
+
+  <h2 class="sec">Next 90 days</h2>
+  <div class="chartcard">
+    <ul class="legend">
+      <li><span class="sw" style="background:var(--s1)"></span> Balance if you don't buy</li>
+      <li><span class="sw" style="background:var(--s2)"></span> Balance with the plan</li>
+      <li><span class="sw d"></span> Your minimum balance</li>
+    </ul>
+    <div class="chartbox">
+      <svg class="chart" id="chart" viewBox="0 0 900 330" role="img"
+        aria-label="Projected balance over the next 90 days, with and without the purchase, against your minimum balance."></svg>
+      <div class="tip" id="tip"></div>
+    </div>
+  </div>
+
+  <h2 class="sec">Your money</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>Right now</h3>
+      <div class="field"><label for="ccy">Currency symbol</label><input type="text" id="ccy" maxlength="4" style="width:90px"></div>
+      <div class="field"><label for="bal">Money available today</label><input type="number" id="bal" step="any"></div>
+      <div class="field"><label for="minbal">Never let it drop below</label><input type="number" id="minbal" step="any"></div>
+      <h3 style="margin-top:22px">Money coming in</h3>
+      <div id="incomeRows"></div><button class="mini" id="addIncome">+ Add income</button>
+    </div>
+    <div class="card">
+      <h3>Regular bills</h3>
+      <div id="expenseRows"></div><button class="mini" id="addExpense">+ Add a bill</button>
+      <p class="hint">“Can cut” bills may be trimmed — never below the floor you set. “Fixed” ones are never touched.</p>
+      <h3 style="margin-top:22px">One-off payments coming up</h3>
+      <div id="oneoffRows"></div><button class="mini" id="addOneoff">+ Add a one-off</button>
+      <div class="toolbar">
+        <button class="mini" id="exportBtn">Export my data</button>
+        <button class="mini" id="resetBtn">Reset to example</button>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    Decision-support, not financial advice. A purchase is only called affordable if your balance stays above your
+    minimum on every one of the next 90 days. The numbers are computed by the same deterministic engine as the
+    <a href="https://github.com/muraliikrishnant/SpendSafe" style="color:var(--brand)">open-source project</a> —
+    no model decides what you can afford.
+  </footer>
+</div>
+
+<script>
+(function(){
+"use strict";
+/* ── point this at your Render service ───────────────────────────────── */
+const API = window.location.hostname.endsWith("github.io")
+  ? "https://spendsafe-api.onrender.com"
+  : "http://localhost:8811";
+
+const $=s=>document.querySelector(s), DAY=86400000, HORIZON=90;
+const uid=()=>Math.random().toString(36).slice(2,9);
+const today=()=>{const d=new Date();d.setHours(0,0,0,0);return d;};
+const addDays=(d,n)=>{const x=new Date(d);x.setDate(x.getDate()+n);return x;};
+const iso=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+const parseISO=s=>{const[a,b,c]=String(s).split("-").map(Number);return new Date(a,(b||1)-1,c||1);};
+const human=d=>d.toLocaleDateString(undefined,{day:"numeric",month:"short"});
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function example(){const t=today(),at=n=>iso(addDays(t,n));return{
+  currency:"₹",balance:84500,minBalance:15000,
+  income:[{id:uid(),label:"Salary",amount:62000,everyDays:30,nextDate:at(12)}],
+  expenses:[
+    {id:uid(),label:"Rent",amount:22000,everyDays:30,nextDate:at(8),flexibility:"fixed",floor:0},
+    {id:uid(),label:"Groceries",amount:4200,everyDays:7,nextDate:at(3),flexibility:"reducible",floor:2500},
+    {id:uid(),label:"Transport",amount:1800,everyDays:7,nextDate:at(5),flexibility:"fixed",floor:0},
+    {id:uid(),label:"Eating out",amount:3500,everyDays:14,nextDate:at(6),flexibility:"reducible",floor:1200},
+    {id:uid(),label:"Streaming",amount:650,everyDays:30,nextDate:at(14),flexibility:"stoppable",floor:0},
+    {id:uid(),label:"Gym",amount:1500,everyDays:30,nextDate:at(19),flexibility:"stoppable",floor:0}],
+  oneOffs:[{id:uid(),label:"Insurance premium",amount:9000,date:at(20)}]};}
+
+let profile, last=null, inflight=null;
+try{ const s=localStorage.getItem("spendsafe.profile");
+  profile = s ? JSON.parse(s) : example();
+  if(s) $("#banner").style.display="none";
+}catch(e){ profile = example(); }
+
+function money(n){const neg=n<0,v=Math.abs(n);
+  const s=v>=1000?Math.round(v).toLocaleString():(Math.round(v*100)/100).toLocaleString();
+  return (neg?"−":"")+(profile.currency||"₹")+s;}
+function persist(){ try{ localStorage.setItem("spendsafe.profile",JSON.stringify(profile)); }catch(e){} }
+
+/* ── editor ─────────────────────────────────────────────────────────── */
+const rowIncome=x=>`<div class="row" data-id="${x.id}">
+  <input class="nm" value="${esc(x.label)}" data-f="label" aria-label="Income name">
+  <input class="amt" type="number" step="any" value="${x.amount}" data-f="amount" aria-label="Amount">
+  <span class="hint">every</span><input class="evy" type="number" value="${x.everyDays}" data-f="everyDays" aria-label="Every N days">
+  <span class="hint">days, next</span><input type="date" value="${x.nextDate}" data-f="nextDate" aria-label="Next date">
+  <button class="del" data-del aria-label="Remove">×</button></div>`;
+const rowExpense=x=>`<div class="row" data-id="${x.id}">
+  <input class="nm" value="${esc(x.label)}" data-f="label" aria-label="Bill name">
+  <input class="amt" type="number" step="any" value="${x.amount}" data-f="amount" aria-label="Amount">
+  <span class="hint">every</span><input class="evy" type="number" value="${x.everyDays}" data-f="everyDays" aria-label="Every N days">
+  <input type="date" value="${x.nextDate}" data-f="nextDate" aria-label="Next date">
+  <select data-f="flexibility" aria-label="Flexibility">
+    <option value="fixed"${x.flexibility==="fixed"?" selected":""}>Fixed</option>
+    <option value="reducible"${x.flexibility==="reducible"?" selected":""}>Can cut</option>
+    <option value="stoppable"${x.flexibility==="stoppable"?" selected":""}>Can pause</option></select>
+  <input class="fl" type="number" step="any" value="${x.floor||0}" data-f="floor" title="Never cut below this" aria-label="Lowest acceptable amount">
+  <button class="del" data-del aria-label="Remove">×</button></div>`;
+const rowOneoff=x=>`<div class="row" data-id="${x.id}">
+  <input class="nm" value="${esc(x.label)}" data-f="label" aria-label="Payment name">
+  <input class="amt" type="number" step="any" value="${x.amount}" data-f="amount" aria-label="Amount">
+  <span class="hint">on</span><input type="date" value="${x.date}" data-f="date" aria-label="Date">
+  <button class="del" data-del aria-label="Remove">×</button></div>`;
+
+function renderEditor(){
+  $("#ccy").value=profile.currency; $("#bal").value=profile.balance; $("#minbal").value=profile.minBalance;
+  $("#incomeRows").innerHTML=(profile.income||[]).map(rowIncome).join("");
+  $("#expenseRows").innerHTML=(profile.expenses||[]).map(rowExpense).join("");
+  $("#oneoffRows").innerHTML=(profile.oneOffs||[]).map(rowOneoff).join("");
+}
+function collect(){
+  profile.currency=$("#ccy").value||"₹";
+  profile.balance=+$("#bal").value||0; profile.minBalance=+$("#minbal").value||0;
+  const grab=sel=>[...document.querySelectorAll(sel+" .row")].map(r=>{
+    const o={id:r.dataset.id};
+    r.querySelectorAll("[data-f]").forEach(el=>{const f=el.dataset.f;
+      o[f]=["label","nextDate","date","flexibility"].includes(f)?el.value:(+el.value||0);});
+    return o;});
+  profile.income=grab("#incomeRows"); profile.expenses=grab("#expenseRows"); profile.oneOffs=grab("#oneoffRows");
+  persist();
+}
+
+/* ── talk to the engine ─────────────────────────────────────────────── */
+async function health(){
+  const el=$("#apiStatus");
+  el.innerHTML='<span class="dot wake"></span>waking the engine…';
+  try{
+    const r=await fetch(API+"/health",{cache:"no-store"});
+    if(!r.ok) throw 0;
+    el.innerHTML='<span class="dot up"></span>engine ready';
+  }catch(e){ el.innerHTML='<span class="dot down"></span>engine unreachable'; }
+}
+
+async function decide(amount,byDate){
+  if(inflight) inflight.abort();
+  inflight=new AbortController();
+  const body={profile,amount,by_date:byDate?iso(byDate):null};
+  const r=await fetch(API+"/api/decide",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body),signal:inflight.signal});
+  if(!r.ok) throw new Error((await r.json().catch(()=>({}))).detail||("HTTP "+r.status));
+  return r.json();
+}
+
+function localAmount(){
+  const m=String($("#q").value).replace(/,/g,"").match(/(\d+(?:\.\d+)?)\s*(k|lakh|l)?/i);
+  if(!m) return null;
+  let v=parseFloat(m[1]); const s=(m[2]||"").toLowerCase();
+  if(s==="k")v*=1000; else if(s==="lakh"||s==="l")v*=100000;
+  return v;
+}
+
+/* ── render ─────────────────────────────────────────────────────────── */
+const CHIP={affordable_now:["now","Yes — buy it today"],affordable_with_plan:["plan","Yes — with a plan"],
+  affordable_later:["later","Not today — but soon"],not_affordable:["no","Not safely, not yet"]};
+
+function renderVerdict(d){
+  const [cls,label]=CHIP[d.status]||["no","—"];
+  const low=Math.min.apply(null,d.forecast.with_plan);
+  const pay=d.payment_plan, when=s=>human(parseISO(s));
+  let headline,because;
+  if(d.status==="affordable_now"){
+    headline=`Pay ${money(d.requested_amount)} today.`;
+    because=`Your balance never drops below ${money(d.min_balance)} in the next 90 days — the tightest it gets is ${money(low)}.`;
+  }else if(d.method==="installments"){
+    headline=`Spread it over ${pay.length} payments of ${money(pay[0].amount)}.`;
+    because=`Paying it all today would dip you under ${money(d.min_balance)}. Split this way, the lowest you reach is ${money(low)}.`;
+  }else if(d.method==="partial_payment"){
+    headline=`Pay ${money(pay[0].amount)} now, the rest on ${when(pay[1].date)}.`;
+    because=`${money(d.amount_safe_today)} is the most you can safely part with today; the balance covers the remaining ${money(pay[1].amount)} by ${when(pay[1].date)}.`;
+  }else if(d.status==="affordable_with_plan"){
+    headline=`Pay ${money(d.requested_amount)} today — if you trim a couple of bills.`;
+    because=`On your current bills it doesn't fit. With the changes below, the lowest your balance reaches is ${money(low)}.`;
+  }else if(d.status==="affordable_later"){
+    headline=`Wait until ${when(d.earliest_full_date)}.`;
+    because=`Today you can only safely spend ${money(d.amount_safe_today)}. By ${when(d.earliest_full_date)} the full ${money(d.requested_amount)} clears without touching your ${money(d.min_balance)} cushion.`;
+  }else{
+    headline=`${money(d.requested_amount)} doesn't fit in the next 90 days.`;
+    because=`The most you could safely spend today is ${money(d.amount_safe_today)}, and even waiting, your balance never builds enough margin above ${money(d.min_balance)}.`;
+  }
+  let html=`<span class="chip ${cls}">${label}</span><p class="headline">${headline}</p><p class="because">${because}</p>
+    <dl class="figs">
+      <div class="fig"><dt>Safe to spend today</dt><dd>${money(d.amount_safe_today)}</dd></div>
+      <div class="fig"><dt>You asked for</dt><dd>${money(d.requested_amount)}</dd></div>
+      <div class="fig"><dt>Full amount clears</dt><dd>${d.earliest_full_date?when(d.earliest_full_date):"—"}</dd></div>
+      <div class="fig"><dt>Lowest point</dt><dd>${money(low)}</dd></div>
+    </dl>`;
+  if(pay.length>1) html+=`<ul class="plan-list">`+pay.map((p,i)=>
+    `<li><span>Payment ${i+1} · ${when(p.date)}</span><span>${money(p.amount)}</span></li>`).join("")+`</ul>`;
+  if(d.spending_changes.length) html+=`<div class="changes"><h4>What you'd need to change</h4><ul>`+
+    d.spending_changes.map(c=>c.action==="stop"
+      ?`<li>Pause <strong>${esc(c.label)}</strong> for now</li>`
+      :`<li>Trim <strong>${esc(c.label)}</strong> to ${money(c.new_amount)} each time</li>`).join("")+`</ul></div>`;
+  $("#verdict").innerHTML=html;
+}
+
+const C={w:900,h:330,l:74,r:20,t:16,b:34};
+function renderChart(d){
+  const svg=$("#chart"),base=d.forecast.baseline,plan=d.forecast.with_plan,n=base.length;
+  const all=base.concat(plan,[d.min_balance]);
+  let lo=Math.min.apply(null,all),hi=Math.max.apply(null,all);
+  const pad=(hi-lo)*0.12||Math.abs(hi)*0.1||1; lo-=pad; hi+=pad;
+  const X=i=>C.l+(i/(n-1))*(C.w-C.l-C.r), Y=v=>C.t+(1-(v-lo)/(hi-lo))*(C.h-C.t-C.b);
+  const path=a=>a.map((v,i)=>`${i?"L":"M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join("");
+  const start=parseISO(d.forecast.dates[0]);
+  const ticks=[0,1,2,3,4].map(k=>lo+(hi-lo)*k/4), xs=[0,30,60,90].filter(o=>o<n);
+  svg.innerHTML=`<rect width="${C.w}" height="${C.h}" fill="var(--viz)"></rect>
+    ${ticks.map(t=>`<line x1="${C.l}" y1="${Y(t).toFixed(1)}" x2="${C.w-C.r}" y2="${Y(t).toFixed(1)}" stroke="var(--rule)"></line>
+      <text x="${C.l-9}" y="${(Y(t)+4).toFixed(1)}" text-anchor="end" font-size="11.5" font-family="IBM Plex Mono,monospace" fill="var(--ink-faint)">${money(t)}</text>`).join("")}
+    ${xs.map(o=>`<text x="${X(o).toFixed(1)}" y="${C.h-12}" text-anchor="middle" font-size="11.5" font-family="IBM Plex Mono,monospace" fill="var(--ink-faint)">${o===0?"today":human(addDays(start,o))}</text>`).join("")}
+    <line x1="${C.l}" y1="${Y(d.min_balance).toFixed(1)}" x2="${C.w-C.r}" y2="${Y(d.min_balance).toFixed(1)}" stroke="var(--crit)" stroke-width="2" stroke-dasharray="7 5"></line>
+    <text x="${C.w-C.r}" y="${(Y(d.min_balance)-7).toFixed(1)}" text-anchor="end" font-size="11.5" font-weight="600" font-family="IBM Plex Mono,monospace" fill="var(--crit)">minimum ${money(d.min_balance)}</text>
+    <path d="${path(base)}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"></path>
+    <path d="${path(plan)}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"></path>
+    <line id="cr" y1="${C.t}" y2="${C.h-C.b}" stroke="var(--ink-faint)" opacity="0"></line>
+    <circle id="m1" r="4.5" fill="var(--s1)" stroke="var(--viz)" stroke-width="2" opacity="0"></circle>
+    <circle id="m2" r="4.5" fill="var(--s2)" stroke="var(--viz)" stroke-width="2" opacity="0"></circle>`;
+  const tip=$("#tip"),box=svg.parentElement;
+  svg.onpointermove=ev=>{
+    const rc=svg.getBoundingClientRect(), px=(ev.clientX-rc.left)/rc.width*C.w;
+    let i=Math.round((px-C.l)/((C.w-C.l-C.r)/(n-1))); i=Math.max(0,Math.min(n-1,i));
+    if(isNaN(i))return;
+    svg.querySelector("#cr").setAttribute("x1",X(i)); svg.querySelector("#cr").setAttribute("x2",X(i));
+    svg.querySelector("#cr").setAttribute("opacity","1");
+    svg.querySelector("#m1").setAttribute("cx",X(i)); svg.querySelector("#m1").setAttribute("cy",Y(base[i])); svg.querySelector("#m1").setAttribute("opacity","1");
+    svg.querySelector("#m2").setAttribute("cx",X(i)); svg.querySelector("#m2").setAttribute("cy",Y(plan[i])); svg.querySelector("#m2").setAttribute("opacity","1");
+    tip.innerHTML=`${i===0?"Today":human(addDays(start,i))}<br><span style="color:var(--s1)">■</span> ${money(base[i])}<br><span style="color:var(--s2)">■</span> ${money(plan[i])}`;
+    tip.style.opacity="1";
+    const bx=box.getBoundingClientRect(); let L=(X(i)/C.w)*bx.width+12;
+    if(L>bx.width-150) L-=162;
+    tip.style.left=L+"px"; tip.style.top=Math.max(0,(Y(Math.min(base[i],plan[i]))/C.h)*bx.height-54)+"px";
+  };
+  svg.onpointerleave=()=>{tip.style.opacity="0";["#cr","#m1","#m2"].forEach(s=>svg.querySelector(s).setAttribute("opacity","0"));};
+}
+
+async function run(amount,byDate){
+  try{
+    const d=await decide(amount,byDate); last=d; renderVerdict(d); renderChart(d);
+    $("#apiStatus").innerHTML='<span class="dot up"></span>engine ready';
+  }catch(e){
+    if(e.name==="AbortError") return;
+    $("#apiStatus").innerHTML='<span class="dot down"></span>engine unreachable';
+    $("#verdict").innerHTML=`<span class="chip no">Can't reach the engine</span>
+      <p class="headline">The calculator is offline.</p>
+      <p class="because">The free Render instance sleeps when idle and takes up to a minute to wake.
+      Give it a moment and press Check again. <span class="hint">(${esc(e.message||"network error")})</span></p>`;
+  }
+}
+
+async function ask(){
+  const text=$("#q").value.trim(); if(!text) return;
+  const btn=$("#askBtn"); btn.disabled=true; const t=btn.textContent; btn.textContent="Thinking…";
+  let amount=localAmount(), byDate=null;
+  try{
+    const r=await fetch(API+"/api/parse",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({text,today:iso(today())})});
+    if(r.ok){ const p=await r.json();
+      if(p.ok&&p.amount>0) amount=p.amount;
+      if(p.ok&&p.by_date){ const d=parseISO(p.by_date), off=Math.round((d-today())/DAY);
+        if(off>=0&&off<=HORIZON) byDate=d; } }
+  }catch(e){}
+  btn.disabled=false; btn.textContent=t;
+  if(!amount){ $("#askHint").textContent="I couldn't find an amount in that — include a number."; return; }
+  $("#askHint").textContent=byDate?`Checking ${money(amount)} by ${human(byDate)}.`:`Checking ${money(amount)}.`;
+  run(amount,byDate);
+}
+
+/* ── events ─────────────────────────────────────────────────────────── */
+$("#askBtn").addEventListener("click",ask);
+$("#q").addEventListener("keydown",e=>{if(e.key==="Enter")ask();});
+["#ccy","#bal","#minbal"].forEach(s=>$(s).addEventListener("input",()=>{
+  collect(); run(last?last.requested_amount:(localAmount()||65000),null);}));
+document.addEventListener("input",e=>{ if(e.target.closest("#incomeRows,#expenseRows,#oneoffRows")){
+  collect(); run(last?last.requested_amount:65000,null);} });
+document.addEventListener("click",e=>{ const d=e.target.closest("[data-del]");
+  if(d){ d.closest(".row").remove(); collect(); run(last?last.requested_amount:65000,null);} });
+$("#addIncome").addEventListener("click",()=>{profile.income.push({id:uid(),label:"Other income",amount:10000,everyDays:30,nextDate:iso(addDays(today(),14))});renderEditor();persist();run(last?last.requested_amount:65000,null);});
+$("#addExpense").addEventListener("click",()=>{profile.expenses.push({id:uid(),label:"New bill",amount:1000,everyDays:30,nextDate:iso(addDays(today(),7)),flexibility:"fixed",floor:0});renderEditor();persist();run(last?last.requested_amount:65000,null);});
+$("#addOneoff").addEventListener("click",()=>{profile.oneOffs.push({id:uid(),label:"One-off payment",amount:5000,date:iso(addDays(today(),21))});renderEditor();persist();run(last?last.requested_amount:65000,null);});
+$("#resetBtn").addEventListener("click",()=>{profile=example();renderEditor();persist();$("#banner").style.display="";run(localAmount()||65000,null);});
+$("#exportBtn").addEventListener("click",()=>{
+  const blob=new Blob([JSON.stringify(profile,null,2)],{type:"application/json"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+  a.download="spendsafe-profile.json"; a.click(); URL.revokeObjectURL(a.href);});
+
+renderEditor(); health(); run(localAmount()||65000,null);
+})();
+</script>
+</body>
+</html>
