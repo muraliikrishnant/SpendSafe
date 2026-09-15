@@ -109,32 +109,15 @@ def api_decide(req: DecideRequest) -> dict:
     }
 
 
-@app.post("/api/parse")
-def api_parse(payload: dict) -> dict:
-    """Turn a typed question into an amount and an optional deadline.
-
-    This is the ONLY place a model is involved, and it never sees the
-    person's finances — just their sentence. If no provider is configured
-    the endpoint reports that, and the front end falls back to reading the
-    number out of the text itself.
-    """
-    text = str(payload.get("text", "")).strip()
-    if not text:
-        raise HTTPException(status_code=422, detail="No question supplied.")
-
-    api_key = os.getenv("NVIDIA_API_KEY", "")
-    if not api_key:
-        return {"ok": False, "reason": "no_model_configured"}
-
+def _parse_with_provider(base_url: str, api_key: str, model: str, text: str, today: str,
+                          timeout: float) -> Optional[dict]:
+    """One provider's attempt at extracting {amount, by_date} from a sentence.
+    Returns None on any failure so the caller can fall back to the other provider."""
     try:
         from openai import OpenAI
-        client = OpenAI(
-            base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-            api_key=api_key, timeout=25, max_retries=1,
-        )
-        today = (payload.get("today") or date.today().isoformat())
+        client = OpenAI(base_url=base_url, api_key=api_key or "unused", timeout=timeout, max_retries=1)
         resp = client.chat.completions.create(
-            model=os.getenv("NVIDIA_TEXT_MODEL", "openai/gpt-oss-20b"),
+            model=model,
             temperature=0,
             max_tokens=120,
             messages=[
@@ -152,12 +135,70 @@ def api_parse(payload: dict) -> dict:
         import re
         raw = resp.choices[0].message.content or "{}"
         match = re.search(r"\{.*\}", raw, re.DOTALL)
-        parsed = json.loads(re.sub(r"(?<=\d),(?=\d{3}\b)", "", match.group(0))) if match else {}
+        if not match:
+            return None
+        parsed = json.loads(re.sub(r"(?<=\d),(?=\d{3}\b)", "", match.group(0)))
         amount = parsed.get("amount")
-        return {
-            "ok": amount is not None,
-            "amount": float(amount) if amount is not None else None,
-            "by_date": parsed.get("by_date"),
-        }
-    except Exception as exc:  # noqa: BLE001 - the caller degrades to local parsing
-        return {"ok": False, "reason": str(exc)[:200]}
+        if amount is None:
+            return None
+        return {"amount": float(amount), "by_date": parsed.get("by_date")}
+    except Exception:  # noqa: BLE001 - caller falls back to the other provider
+        return None
+
+
+@app.post("/api/parse")
+def api_parse(payload: dict) -> dict:
+    """Turn a typed question into an amount and an optional deadline.
+
+    This is the ONLY place a model is involved, and it never sees the
+    person's finances — just their sentence. Both NVIDIA and Ollama are
+    queried concurrently (when configured) and cross-checked, same as the
+    batch pipeline's debate: agreement wins outright; disagreement falls
+    back to the lower (more conservative) amount rather than guessing. If
+    neither provider is configured the endpoint reports that, and the
+    front end falls back to reading the number out of the text itself.
+    """
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="No question supplied.")
+    today = payload.get("today") or date.today().isoformat()
+
+    providers = []
+    nvidia_key = os.getenv("NVIDIA_API_KEY", "")
+    if nvidia_key:
+        providers.append(("nvidia",
+            os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+            nvidia_key, os.getenv("NVIDIA_TEXT_MODEL", "openai/gpt-oss-20b"), 25.0))
+    ollama_url = os.getenv("OLLAMA_BASE_URL", "")
+    if ollama_url and not ollama_url.startswith("http://localhost") and not ollama_url.startswith("http://127."):
+        providers.append(("ollama", ollama_url, os.getenv("OLLAMA_API_KEY", ""),
+            os.getenv("OLLAMA_TEXT_MODEL", "qwen3:14b"), 30.0))
+
+    if not providers:
+        return {"ok": False, "reason": "no_model_configured"}
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        futures = {pool.submit(_parse_with_provider, base, key, model, text, today, timeout): name
+                   for name, base, key, model, timeout in providers}
+        results = {futures[f]: f.result() for f in futures}
+
+    ok_results = {name: r for name, r in results.items() if r}
+    if not ok_results:
+        return {"ok": False, "reason": "all_providers_failed"}
+    if len(ok_results) == 1:
+        only = next(iter(ok_results.values()))
+        return {"ok": True, "amount": only["amount"], "by_date": only["by_date"]}
+
+    amounts = {name: r["amount"] for name, r in ok_results.items()}
+    vals = list(amounts.values())
+    agree = abs(vals[0] - vals[1]) <= max(vals) * 0.02
+    chosen = ok_results["nvidia"] if "nvidia" in ok_results else next(iter(ok_results.values()))
+    if not agree:
+        chosen = min(ok_results.values(), key=lambda r: r["amount"])
+    return {
+        "ok": True,
+        "amount": chosen["amount"],
+        "by_date": chosen["by_date"],
+        "debate": {"providers": amounts, "agreed": agree},
+    }

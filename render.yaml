@@ -17,5 +17,14 @@ services:
         sync: false
       - key: NVIDIA_TEXT_MODEL
         value: openai/gpt-oss-20b
+      # Optional second provider for cross-checking /api/parse. Must be a
+      # URL Render can reach over the internet (a hosted/cloud Ollama
+      # endpoint) — NOT http://localhost, which only exists on your laptop.
+      - key: OLLAMA_BASE_URL
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_TEXT_MODEL
+        value: qwen3:14b
       - key: PYTHON_VERSION
         value: "3.11"

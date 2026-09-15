@@ -392,11 +392,16 @@ async function ask(){
     if(r.ok){ const p=await r.json();
       if(p.ok&&p.amount>0) amount=p.amount;
       if(p.ok&&p.by_date){ const d=parseISO(p.by_date), off=Math.round((d-today())/DAY);
-        if(off>=0&&off<=HORIZON) byDate=d; } }
+        if(off>=0&&off<=HORIZON) byDate=d; }
+      if(p.debate&&!p.debate.agreed){
+        const vals=Object.entries(p.debate.providers).map(([k,v])=>`${k}: ${money(v)}`).join(", ");
+        $("#askHint").textContent=`Models disagreed (${vals}) — used the lower, more conservative figure.`;
+      } }
   }catch(e){}
   btn.disabled=false; btn.textContent=t;
   if(!amount){ $("#askHint").textContent="I couldn't find an amount in that — include a number."; return; }
-  $("#askHint").textContent=byDate?`Checking ${money(amount)} by ${human(byDate)}.`:`Checking ${money(amount)}.`;
+  if(!$("#askHint").textContent.startsWith("Models disagreed"))
+    $("#askHint").textContent=byDate?`Checking ${money(amount)} by ${human(byDate)}.`:`Checking ${money(amount)}.`;
   run(amount,byDate);
 }
 
